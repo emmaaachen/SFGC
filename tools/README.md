@@ -102,9 +102,18 @@ time the app uses `geom_orig`, touch a single row group.
   also unnecessary: `&&` is a bbox test, so the four-comparison form is
   definitionally equivalent. The round-trip against the dump text runs instead.
 
-## Not done here
+## Using it from the app
 
-Rewiring `app.R` from RPostgres to DuckDB is out of scope; see the follow-on
-section of `PARQUET_CONVERSION_PLAN.md`. Note that `st_read(con, query=)`
-(`app.R:944`, `app.R:1118`) has no DuckDB equivalent and becomes a fetch plus
-`sf::st_as_sf(df, wkb = "geom", crs = 4326)`.
+`app.R` reads these files directly over S3 — there is no Postgres server any
+more. It needs the `duckdb` R package (>= 1.5) and reads `AWS_ENDPOINT_URL`,
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `BUCKET_NAME` from `.env`, or
+from the environment when `.env` is absent. See `.env.example`.
+
+Two details of the wiring are worth knowing:
+
+- The app sets `enable_geoparquet_conversion = false`, so `geom` comes back as
+  raw WKB and `sf` parses it directly. That means **no spatial extension is
+  needed at runtime** — only `httpfs`.
+- `tract_columns.parquet` is what rebuilds `var_choices` and `categorical_vars`,
+  aliasing each snake_case column back to its display label in the SELECT. The
+  generated lists are identical to the ones `app.R` used to hardcode.
