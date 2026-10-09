@@ -1,4 +1,13 @@
 .DS_Store
 .RData
 .Rhistory
+.Rproj.user
+
+# Local secrets (S3 credentials for the Taiga gateway)
+.env
+
+# Source dumps and conversion artifacts
 classified_tracts_levels.sql
+classified_tracts_levels.geojson
+build/
+*.parquet

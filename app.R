@@ -1,6 +1,5 @@
 library(shiny)
-library(RPostgres)
-library(rpostgis)
+library(duckdb)
 library(DBI)
 library(sf)
 library(dplyr)
@@ -26,46 +25,136 @@ library(htmltools)
 # defines variables, lists, dictionaries, etc
 # ------------------------------------------------------------------------------
 
-# modify con for online database
-con <- dbConnect(RPostgres::Postgres(), dbname = "postgres", host = "localhost",
-                 port = 5432, user = "emmachen")
+# ------------------------------------------------------------------------------
+# data source: Parquet on S3, queried in place by DuckDB
+# ------------------------------------------------------------------------------
 
-table_name <- "classified_tracts_levels"
+# Endpoint, credentials and bucket come from the environment. A .env file next to
+# the app is read first but never overrides a variable that is already set, so a
+# deployment can supply real environment variables and ship no .env at all.
+# Parsed the same way tools/lib.sh parses it: "KEY = value", '#' comments, no
+# shell quoting.
+load_dot_env <- function(path = ".env") {
+  if (!file.exists(path)) return(invisible(FALSE))
+  for (line in readLines(path, warn = FALSE)) {
+    if (!grepl("=", line, fixed = TRUE)) next
+    if (grepl("^\\s*#", line)) next
+    key <- trimws(sub("=.*$", "", line))
+    val <- trimws(sub("^[^=]*=", "", line))
+    val <- sub('^"(.*)"$', "\\1", val)
+    val <- sub("^'(.*)'$", "\\1", val)
+    if (nzchar(key) && !nzchar(Sys.getenv(key))) {
+      do.call(Sys.setenv, stats::setNames(list(val), key))
+    }
+  }
+  invisible(TRUE)
+}
 
-geom_cols <- c(
-  "geom_orig",
-  "geom_high",
-  "geom_med",
-  "geom_low",
-  "geom_lowest"
+load_dot_env()
+
+env_or_stop <- function(name) {
+  val <- Sys.getenv(name)
+  if (!nzchar(val)) {
+    stop(sprintf("%s is not set - add it to .env or to the environment", name),
+         call. = FALSE)
+  }
+  val
+}
+
+s3_endpoint <- env_or_stop("AWS_ENDPOINT_URL")
+s3_bucket   <- env_or_stop("BUCKET_NAME")
+s3_prefix   <- Sys.getenv("PARQUET_PREFIX", "sfgc/parquet")
+# The Versity gateway pins us-east-1; other regions come back as HTTP 400.
+s3_region   <- Sys.getenv("AWS_DEFAULT_REGION", "us-east-1")
+
+# DuckDB's S3 secret wants host:port, with the scheme split out into USE_SSL.
+s3_use_ssl  <- !grepl("^http://", s3_endpoint)
+s3_hostport <- sub("/+$", "", sub("^[a-z]+://", "", s3_endpoint))
+
+con <- dbConnect(duckdb::duckdb())
+
+dbExecute(con, "INSTALL httpfs")
+dbExecute(con, "LOAD httpfs")
+
+# URL_STYLE 'path' is required: the gateway is Versity, not AWS.
+dbExecute(con, sprintf(
+  "CREATE OR REPLACE SECRET s3_source (
+     TYPE s3, PROVIDER config,
+     KEY_ID %s, SECRET %s,
+     ENDPOINT %s, URL_STYLE 'path',
+     USE_SSL %s, REGION %s
+   )",
+  DBI::dbQuoteString(con, env_or_stop("AWS_ACCESS_KEY_ID")),
+  DBI::dbQuoteString(con, env_or_stop("AWS_SECRET_ACCESS_KEY")),
+  DBI::dbQuoteString(con, s3_hostport),
+  if (s3_use_ssl) "true" else "false",
+  DBI::dbQuoteString(con, s3_region)
+))
+
+for (setting in c(
+  # Hand the geometry back as raw WKB instead of a DuckDB GEOMETRY: sf parses
+  # WKB directly, so the app needs no spatial extension.
+  "SET enable_geoparquet_conversion = false",
+  "SET parquet_metadata_cache = true",      # fetch each Parquet footer once
+  "SET prefetch_all_parquet_files = false"  # leave off, it defeats row-group pruning
+)) {
+  tryCatch(
+    dbExecute(con, setting),
+    error = function(e) warning(
+      sprintf("DuckDB rejected `%s`: %s", setting, conditionMessage(e)),
+      call. = FALSE
+    )
+  )
+}
+
+# the connection is shared by every session, so it is closed with the app
+onStop(function() {
+  if (DBI::dbIsValid(con)) dbDisconnect(con, shutdown = TRUE)
+})
+
+# a read_parquet(...) source expression for one of the published files
+parquet_src <- function(name) {
+  url <- sprintf("s3://%s/%s/%s.parquet", s3_bucket, s3_prefix, name)
+  glue("read_parquet({DBI::dbQuoteString(con, url)})")
+}
+
+qi <- function(x) as.character(DBI::dbQuoteIdentifier(con, x))
+
+# tract_columns.parquet maps each snake_case Parquet column to the display label
+# the app is written against, so var_choices and the popup tree are built from
+# the data rather than hardcoded.
+tract_columns <- dbGetQuery(con, glue("
+  SELECT name, label, group_name, kind, ordinal
+  FROM {parquet_src('tract_columns')}
+  ORDER BY ordinal
+"))
+
+attr_cols <- tract_columns$label
+col_name  <- stats::setNames(tract_columns$name, tract_columns$label)
+
+# group order for the dropdown and the popup tree; the lookup table orders
+# columns but carries no ordering for the groups themselves
+var_group_order <- c(
+  "category", "race", "age", "household type", "language", "education",
+  "occupation", "housing unit type", "housing costs", "occupants", "income",
+  "other"
 )
 
-all_cols   <- dbListFields(con, table_name)
-attr_cols <- setdiff(all_cols, geom_cols)
+# `predominant_race` has no group and is deliberately left out of the UI
+grouped_cols <- tract_columns[!is.na(tract_columns$group_name), ]
 
-var_choices <- list(
-  "category" = c("Superclass", "Class"),
-  "race" = c("% white alone", "% black or african american alone", "% american indian and alaska native alone", 
-             "% asian alone", "% native hawaiian and other pacific islander alone", "% some other race alone", 
-             "% two or more races"),
-  "age" = c("% under 18 years", "% 18 to 39 years", "% 40 to 64 years", "% 65+ years"),
-  "household type" = c("% couple only household", "% couple with children", 
-                       "% single parent with children", "% nonfamily households"),
-  "language" = c("% english only", "% spanish"),
-  "education" = c("% with high school or less", "% with some college, associate's, or bachelor's degree",
-                  "% with master's degree or higher"),
-  "occupation" = c("% in management, business, science, and arts occupations",
-                   "% in service occupations", "% in sales and office occupations", "% in natural resources, construction, and maintenance",    
-                   "% in production, transportation, and material moving"),
-  "housing unit type" = c("% as 1, detached or attached", "% as 2 to 4", "% as 5 or more", "% as mobile home"),
-  "housing costs" = c("Median house value", "Median gross rent",
-                      "% spending over 30% of household income on housing"),
-  "occupants" = c("% owner occupied", "% renter occupied"),
-  "income" = c("Median household income", "% with income below poverty level", "% with public assistance income"),
-  "other" = c("% hispanic or latino", "% employed", "Median year householder moved into unit")
-)
+var_choices <- local({
+  groups <- c(
+    intersect(var_group_order, grouped_cols$group_name),
+    setdiff(unique(grouped_cols$group_name), var_group_order)
+  )
+  stats::setNames(
+    lapply(groups, function(g) grouped_cols$label[grouped_cols$group_name == g]),
+    groups
+  )
+})
 
-categorical_vars <- c("Superclass", "Class")
+categorical_vars <- grouped_cols$label[grouped_cols$kind == "categorical"]
 
 superclass_labels <- c(
   A = "A. Mainstream America",
@@ -153,88 +242,150 @@ build_query <- function(
     bounds = NULL,
     geom_name,
     filters = list()
-) {  
-  filter_clauses <- character()
-  
+) {
+  conditions <- character()
+
+  if (!is.null(bounds)) {
+
+    # PostGIS's `geom_orig && ST_MakeEnvelope(...)` was itself a bounding-box
+    # test. Every Parquet file carries the same four bbox columns, always
+    # computed from geom_orig, so these comparisons return an identical row set
+    # at every level of detail.
+    conditions <- c(
+      conditions,
+      glue("
+      g.xmin <= {bounds$east}
+      AND g.xmax >= {bounds$west}
+      AND g.ymin <= {bounds$north}
+      AND g.ymax >= {bounds$south}
+    ")
+    )
+
+  }
+
   for (f in filters) {
-    
-    col <- DBI::dbQuoteIdentifier(con, f$variable)
-    
+
+    # filters name a column by its display label; the Parquet column is snake_case
+    name <- unname(col_name[f$variable])
+    if (is.na(name)) next
+
+    col <- glue("a.{qi(name)}")
+
     # range for numeric columns
     if (f$type == "numeric") {
-      
+
       min_val <- suppressWarnings(as.numeric(f$min))
       max_val <- suppressWarnings(as.numeric(f$max))
-      
+
       if (anyNA(c(min_val, max_val))) next
-      
-      filter_clauses <- c(
-        filter_clauses,
+
+      conditions <- c(
+        conditions,
         glue(
           "{col} BETWEEN {min_val} AND {max_val}"
         )
       )
-      
+
       # categories for categorical columns
     } else if (f$type == "categorical") {
-      
+
       if (length(f$values) == 0) next
-      
+
       values <- DBI::dbQuoteString(con, f$values)
-      
-      filter_clauses <- c(
-        filter_clauses,
+
+      conditions <- c(
+        conditions,
         glue(
           "{col} IN ({paste(values, collapse=', ')})"
         )
       )
-      
+
     }
-    
+
   }
-  
-  # conditions/where clause: not null, within bounds, and within filter range/categories
-  conditions <- c(
-    glue("{geom_name} IS NOT NULL") # some might be null at certain zoom/simplification levels
-  )
-  
-  if (!is.null(bounds)) {
-    
-    conditions <- c(
-      conditions,
-      glue("
-      geom_orig && ST_MakeEnvelope(
-        {bounds$west},
-        {bounds$south},
-        {bounds$east},
-        {bounds$north},
-        4326
-      )
-    ")
-    )
-    
+
+  where_clause <- if (length(conditions) == 0) {
+    ""
+  } else {
+    glue("WHERE {paste(conditions, collapse = '\nAND ')}")
   }
-  
-  conditions <- c(
-    conditions,
-    filter_clauses
+
+  # alias every column back to its display label, which is what the rest of the
+  # app (popups, colouring, filters) addresses columns by
+  cols <- paste(
+    sprintf("a.%s AS %s", qi(tract_columns$name), qi(tract_columns$label)),
+    collapse = ",\n      "
   )
-  
-  where_clause <- glue(
-    "WHERE {paste(conditions, collapse = '\nAND ')}"
-  )
-  
-  cols <- paste(DBI::dbQuoteIdentifier(con, attr_cols), collapse = ", ")
-  
+
   # complete query
   glue("
     SELECT
       {cols},
-      {geom_name} AS geometry
-    FROM {DBI::dbQuoteIdentifier(con, table_name)}
+      g.geom AS geometry
+    FROM {parquet_src(paste0('tract_', geom_name))} g
+    JOIN {parquet_src('tract_attrs')} a USING (tract_id)
     {where_clause}
   ")
 }
+
+# Runs a query and returns an sf data frame. st_read(con, query = ) has no
+# DuckDB equivalent; with enable_geoparquet_conversion off the geometry arrives
+# as raw WKB, which sf reads directly.
+read_sf_query <- function(query) {
+
+  df <- dbGetQuery(con, query)
+
+  wkb <- df[["geometry"]]
+  df[["geometry"]] <- NULL
+
+  if (!is.list(wkb)) wkb <- as.list(wkb)
+
+  df$geometry <- sf::st_as_sfc(
+    structure(wkb, class = "WKB"),
+    EWKB = FALSE,
+    crs = 4326
+  )
+
+  sf::st_as_sf(df, sf_column_name = "geometry")
+}
+
+# Ranges and category levels behind the filter widgets. One aggregate over
+# tract_attrs, computed once at startup: the values do not depend on the
+# viewport or the zoom level, so there is no reason to fetch whole geometries
+# for them.
+var_stats <- local({
+
+  numeric_cols <- tract_columns[tract_columns$kind == "numeric", ]
+  cat_cols     <- tract_columns[tract_columns$kind == "categorical", ]
+
+  parts <- c(
+    sprintf("min(%s) AS %s", qi(numeric_cols$name), qi(paste0("min.", numeric_cols$label))),
+    sprintf("max(%s) AS %s", qi(numeric_cols$name), qi(paste0("max.", numeric_cols$label))),
+    sprintf(
+      "list_sort(array_agg(DISTINCT %s) FILTER (WHERE %s IS NOT NULL)) AS %s",
+      qi(cat_cols$name), qi(cat_cols$name), qi(paste0("lv.", cat_cols$label))
+    )
+  )
+
+  row <- dbGetQuery(con, glue("
+    SELECT {paste(parts, collapse = ',\n           ')}
+    FROM {parquet_src('tract_attrs')}
+  "))
+
+  stats::setNames(
+    c(
+      lapply(numeric_cols$label, function(lbl) {
+        lo <- as.numeric(row[[paste0("min.", lbl)]])
+        hi <- as.numeric(row[[paste0("max.", lbl)]])
+        list(kind = "numeric", min = lo, max = hi)
+      }),
+      lapply(cat_cols$label, function(lbl) {
+        list(kind = "categorical", levels = as.character(row[[paste0("lv.", lbl)]][[1]]))
+      })
+    ),
+    c(numeric_cols$label, cat_cols$label)
+  )
+})
 
 # ------------------------------------------------------------------------------
 # Filter module: ui and server for filtering. Implemented in main server
@@ -258,7 +409,7 @@ filterRowUI <- function(id) {
 }
 
 # ------- server outputs filter options and stores user selection --------------
-filterRowServer <- function(id, full_data) {
+filterRowServer <- function(id, stats_for_var) {
   moduleServer(id, function(input, output, session) {
     ns <- session$ns
     
@@ -268,14 +419,18 @@ filterRowServer <- function(id, full_data) {
       var_i <- input$var
       req(var_i)
       
-      df <- full_data()
+      st <- stats_for_var[[var_i]]
+      
+      if (is.null(st)) {
+        return(tags$p(sprintf("No data available for '%s'.", var_i)))
+      }
       
       # categorical options
       if (var_i %in% categorical_vars) {
         
         colors <- if (var_i == "Superclass") superclass_colors else class_colors
         
-        levels_i <- sort(unique(stats::na.omit(as.character(sf::st_drop_geometry(df)[[var_i]]))))
+        levels_i <- st$levels
         
         pickerInput(
           inputId = ns("range"),
@@ -306,15 +461,12 @@ filterRowServer <- function(id, full_data) {
         # numeric options (range)
       } else {
         
-        vals <- suppressWarnings(as.numeric(sf::st_drop_geometry(df)[[var_i]]))
-        vals <- vals[is.finite(vals)]
-        
-        if (length(vals) == 0) {
+        if (!is.finite(st$min) || !is.finite(st$max)) {
           return(tags$p(sprintf("No numeric data available for '%s'.", var_i)))
         }
         
-        lo <- floor(min(vals))
-        hi <- ceiling(max(vals))
+        lo <- floor(st$min)
+        hi <- ceiling(st$max)
         
         # sliderInput requires a strictly positive range
         if (lo == hi) hi <- lo + 1
@@ -917,11 +1069,6 @@ server <- function(input, output, session) {
       setView(-110, 39, zoom = 4)
   })
   
-  # connects to database
-  session$onSessionEnded(function() {
-    if (DBI::dbIsValid(con)) dbDisconnect(con)
-  })
-  
   # defines map and default conditions
   default_bounds <- list(north = 50, south = 25, east = -57, west = -125)
   default_zoom   <- 4
@@ -935,13 +1082,6 @@ server <- function(input, output, session) {
     ) %>%
       addTiles() %>%
       setView(-110, 39, zoom = default_zoom)
-  })
-  
-  # full table (not restricted to viewport) for filtering and popups
-  full_data <- reactive({
-    geom_name <- geom_bucket()
-    q <- build_query(bounds = NULL, geom_name = geom_name)
-    st_read(con, query = q, quiet = TRUE)
   })
   
   # holds the currently-drawn data to avoid recomputing on every redraw
@@ -1064,7 +1204,7 @@ server <- function(input, output, session) {
       ui = div(id = paste0("filterRow_", id), filterRowUI(id))
     )
     
-    mod <- filterRowServer(id, full_data)
+    mod <- filterRowServer(id, var_stats)
     filter_returns[[id]] <- mod
     filter_ids(c(filter_ids(), id))
     
@@ -1115,7 +1255,7 @@ server <- function(input, output, session) {
     )
     
     df <- tryCatch(
-      st_read(con, query = q, quiet = TRUE),
+      read_sf_query(q),
       error = function(e) {
         showNotification(
           paste("Couldn't load map data:", conditionMessage(e)),
